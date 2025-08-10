@@ -1,41 +1,80 @@
-﻿using Microsoft.AspNetCore.Authentication.JwtBearer;
+﻿using System.Text;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using PenToPublic.Data;
 using PenToPublic.Models;
 using PenToPublic.Services;
-using System.Text;
 using AutoMapper;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// ➤ Database Configuration
+// ---------------------------------------
+// Database Configuration (MSSQL)
+// ---------------------------------------
+var dbConn = Environment.GetEnvironmentVariable("DB_CONNECTION")
+             ?? builder.Configuration.GetConnectionString("PenToPublicContext");
+
+if (string.IsNullOrWhiteSpace(dbConn))
+{
+    throw new InvalidOperationException("❌ Database connection string not found. Set DB_CONNECTION env var.");
+}
+
 builder.Services.AddDbContext<PenToPublicContext>(options =>
-    options.UseSqlServer(
-        builder.Configuration.GetConnectionString("PenToPublicContext")
-        ?? throw new InvalidOperationException("Connection string not found.")
-    )
+    options.UseSqlServer(dbConn)
 );
 
-// ➤ Email Service for OTP (Forgot Password)
+// ---------------------------------------
+// Email Service (SMTP for OTP / Forgot Password)
+// ---------------------------------------
 builder.Services.Configure<SmtpSettings>(builder.Configuration.GetSection("SmtpSettings"));
+builder.Services.PostConfigure<SmtpSettings>(smtp =>
+{
+    smtp.Host = Environment.GetEnvironmentVariable("SMTP_HOST") ?? smtp.Host;
+    smtp.Port = int.TryParse(Environment.GetEnvironmentVariable("SMTP_PORT"), out var port) ? port : smtp.Port;
+    smtp.SenderEmail = Environment.GetEnvironmentVariable("SMTP_EMAIL") ?? smtp.SenderEmail;
+    smtp.SenderName = Environment.GetEnvironmentVariable("SMTP_NAME") ?? smtp.SenderName;
+    smtp.Username = Environment.GetEnvironmentVariable("SMTP_USERNAME") ?? smtp.Username;
+    smtp.Password = Environment.GetEnvironmentVariable("SMTP_PASSWORD") ?? smtp.Password;
+});
 builder.Services.AddScoped<EmailService>();
 
-// ➤ AutoMapper
+// ---------------------------------------
+// AutoMapper
+// ---------------------------------------
 builder.Services.AddAutoMapper(AppDomain.CurrentDomain.GetAssemblies());
 
-// ➤ Razorpay Integration
+// ---------------------------------------
+// Razorpay Service
+// ---------------------------------------
+builder.Services.Configure<RazorpaySettings>(builder.Configuration.GetSection("Razorpay"));
+builder.Services.PostConfigure<RazorpaySettings>(rzp =>
+{
+    rzp.Key = Environment.GetEnvironmentVariable("RAZORPAY_KEY") ?? rzp.Key;
+    rzp.Secret = Environment.GetEnvironmentVariable("RAZORPAY_SECRET") ?? rzp.Secret;
+});
 builder.Services.AddScoped<RazorpayService>();
 
-// ➤ Authentication using JWT
-var jwtSettings = builder.Configuration.GetSection("Jwt");
-var key = Encoding.UTF8.GetBytes(jwtSettings["Key"]);
+// ---------------------------------------
+// JWT Authentication
+// ---------------------------------------
+var jwtKey = Environment.GetEnvironmentVariable("JWT_KEY")
+             ?? builder.Configuration["Jwt:Key"];
+var jwtIssuer = Environment.GetEnvironmentVariable("JWT_ISSUER")
+                ?? builder.Configuration["Jwt:Issuer"];
+var jwtAudience = Environment.GetEnvironmentVariable("JWT_AUDIENCE")
+                  ?? builder.Configuration["Jwt:Audience"];
+
+if (string.IsNullOrWhiteSpace(jwtKey))
+    throw new InvalidOperationException("❌ JWT_KEY is required for authentication.");
+
+var keyBytes = Encoding.UTF8.GetBytes(jwtKey);
 
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options =>
     {
-        options.RequireHttpsMetadata = false;
+        options.RequireHttpsMetadata = false; // Set true in production with HTTPS
         options.SaveToken = true;
         options.TokenValidationParameters = new TokenValidationParameters
         {
@@ -43,29 +82,31 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ValidateAudience = true,
             ValidateLifetime = true,
             ValidateIssuerSigningKey = true,
-            ValidIssuer = jwtSettings["Issuer"],
-            ValidAudience = jwtSettings["Audience"],
-            IssuerSigningKey = new SymmetricSecurityKey(key),
+            ValidIssuer = jwtIssuer,
+            ValidAudience = jwtAudience,
+            IssuerSigningKey = new SymmetricSecurityKey(keyBytes),
             ClockSkew = TimeSpan.Zero
         };
     });
 
-// ➤ Authorization
 builder.Services.AddAuthorization();
 
-// ➤ CORS for Frontend (React CRA or Vite)
+// ---------------------------------------
+// CORS (currently open — adjust for prod)
+// ---------------------------------------
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowAll", policy =>
     {
-        policy.AllowAnyOrigin()   // <-- Allows requests from any origin
+        policy.AllowAnyOrigin()
               .AllowAnyHeader()
               .AllowAnyMethod();
     });
 });
 
-
-// ➤ Swagger with JWT Token UI
+// ---------------------------------------
+// Swagger + JWT Auth
+// ---------------------------------------
 builder.Services.AddSwaggerGen(c =>
 {
     c.SwaggerDoc("v1", new OpenApiInfo
@@ -74,7 +115,6 @@ builder.Services.AddSwaggerGen(c =>
         Version = "v1"
     });
 
-    // Add JWT Auth to Swagger
     c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
     {
         In = ParameterLocation.Header,
@@ -98,13 +138,16 @@ builder.Services.AddSwaggerGen(c =>
     });
 });
 
-// ➤ Add Controllers
+// ---------------------------------------
+// Controllers
+// ---------------------------------------
 builder.Services.AddControllers();
 
-// ➤ Build & Configure HTTP Pipeline
+// ---------------------------------------
+// Build & Middleware Pipeline
+// ---------------------------------------
 var app = builder.Build();
 
-// ➤ Middleware
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
